@@ -205,6 +205,24 @@
     .btn-primary:hover { background: #2ea043; }
     .btn-danger { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
     .btn-danger:hover { background: #3d1a1a; color: #f85149; border-color: #f85149; }
+    .btn-commit { background: #1a3a5c; color: #58a6ff; border: 1px solid #1f4a7a; flex:1.4; }
+    .btn-commit:hover { background: #1f4a7a; color: #79bfff; }
+
+    /* Committed Bends List */
+    .committed-bend-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 5px 6px; background: #161b22; border: 1px solid #30363d;
+      border-radius: 5px; margin-bottom: 4px; gap: 6px;
+    }
+    .cb-info { display: flex; align-items: center; gap: 6px; flex: 1; flex-wrap: wrap; }
+    .cb-badge { font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px; }
+    .cb-angle { font-size: 12px; font-weight: 600; color: #e6edf3; }
+    .cb-origin { font-size: 10px; color: #8b949e; }
+    .cb-del {
+      background: none; border: none; color: #8b949e; cursor: pointer;
+      font-size: 11px; padding: 2px 5px; border-radius: 3px; flex-shrink: 0;
+    }
+    .cb-del:hover { background: #3d1a1a; color: #f85149; }
 
     /* Toggle */
     .toggle-row {
@@ -324,7 +342,26 @@
           <input type="range" id="angleSlider" min="-360" max="360" step="1" value="0"
             oninput="onAngleInput(this.value)" onchange="onAngleChange(this.value)">
         </div>
-        <button class="btn btn-danger" onclick="resetBend()">↩ リセット (0°)</button>
+        <div style="display:flex;gap:6px;margin-top:4px;">
+          <button class="btn btn-danger" style="flex:1" onclick="resetBend()">↩ リセット</button>
+          <button class="btn btn-commit" onclick="commitBend()" title="現在のベンドを確定し、別の方向にさらに曲げられます">＋ 確定して追加</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Committed Bends -->
+    <div class="section" id="committedSection">
+      <div class="section-header">
+        確定済みベンド
+        <span id="committedCount" style="color:#8b949e;font-weight:normal;font-size:10px;margin-left:6px;">0件</span>
+      </div>
+      <div class="section-body">
+        <div style="font-size:10px;color:#8b949e;margin-bottom:6px;">
+          「確定して追加」を押すと現在のベンドが確定され、別の軸でさらに曲げられます。
+        </div>
+        <div id="committedBendList">
+          <div style="color:#8b949e;font-size:11px;padding:4px 0;">まだ確定済みベンドはありません</div>
+        </div>
       </div>
     </div>
 
@@ -637,6 +674,21 @@ const undoStack = [];
 const redoStack = [];
 let sliderStartState = null;  // スライダードラッグ開始時の状態
 let originFocusState = null;  // 起点入力フォーカス時の状態
+let committedBends = [];      // 確定済みベンド [{axis,angleDeg,ox,oy,oz}, ...]
+
+// 頂点配列からバウンディングボックスを計算
+function computeBoundsFromVerts(verts) {
+  let xMin=Infinity, xMax=-Infinity, yMin=Infinity, yMax=-Infinity, zMin=Infinity, zMax=-Infinity;
+  for (let i = 0; i < verts.length; i += 3) {
+    if (verts[i]   < xMin) xMin = verts[i];
+    if (verts[i]   > xMax) xMax = verts[i];
+    if (verts[i+1] < yMin) yMin = verts[i+1];
+    if (verts[i+1] > yMax) yMax = verts[i+1];
+    if (verts[i+2] < zMin) zMin = verts[i+2];
+    if (verts[i+2] > zMax) zMax = verts[i+2];
+  }
+  return { xMin, xMax, yMin, yMax, zMin, zMax };
+}
 
 // アプリ全状態をスナップショット（参照渡しで軽量）
 function captureFullState() {
@@ -646,6 +698,7 @@ function captureFullState() {
     ox: parseFloat(document.getElementById('originX').value) || 0,
     oy: parseFloat(document.getElementById('originY').value) || 0,
     oz: parseFloat(document.getElementById('originZ').value) || 0,
+    committedBends: committedBends.map(b => ({ ...b })),
     comps: components.map(c => ({
       id: c.id,
       name: c.name,
@@ -717,6 +770,8 @@ function applyFullState(state) {
     }
   });
 
+  committedBends = (state.committedBends || []).map(b => ({ ...b }));
+  renderCommittedBendList();
   selectedCompId = null;
   updateBend();
   renderCompList();
@@ -1104,11 +1159,11 @@ function rebuildAllMeshes() {
 // ============================================================
 // Bend Deformation
 // ============================================================
-function applyBend(srcVerts, axis, angleDeg, ox, oy, oz) {
+function applyBend(srcVerts, axis, angleDeg, ox, oy, oz, bounds) {
   const result = new Float32Array(srcVerts);
   const angleRad = angleDeg * Math.PI / 180;
   if (Math.abs(angleRad) < 0.0001) return result;
-  const { xMin, xMax, yMin, yMax } = meshBounds;
+  const { xMin, xMax, yMin, yMax } = bounds || meshBounds;
 
   if (axis === 'X') {
     const length = yMax - yMin;
@@ -1156,8 +1211,17 @@ function updateBend() {
 
   for (const comp of components) {
     if (!comp.mesh) continue;
-    const src = comp.subdivVerts || comp.originalVerts;
-    const bent = applyBend(src, currentAxis, angleDeg, ox, oy, oz);
+    // 確定済みベンドを順番に適用（各ステップで動的にバウンズ再計算）
+    let src = comp.subdivVerts || comp.originalVerts;
+    for (const cb of committedBends) {
+      const cbBounds = computeBoundsFromVerts(src);
+      src = applyBend(src, cb.axis, cb.angleDeg, cb.ox, cb.oy, cb.oz, cbBounds);
+    }
+    // 現在のライブベンドを適用
+    const liveBounds = committedBends.length > 0
+      ? computeBoundsFromVerts(src)
+      : (meshBounds || computeBoundsFromVerts(src));
+    const bent = applyBend(src, currentAxis, angleDeg, ox, oy, oz, liveBounds);
 
     const posAttr = comp.mesh.geometry.attributes.position;
     if (posAttr.array.length !== bent.length) {
@@ -1197,6 +1261,60 @@ function onAngleChange(val) {
   }
   document.getElementById('angleVal').textContent = val + '°';
   updateBend();
+}
+
+// ============================================================
+// 多段ベンド
+// ============================================================
+function commitBend() {
+  const angleDeg = parseFloat(document.getElementById('angleSlider').value) || 0;
+  if (Math.abs(angleDeg) < 0.5) return;  // 角度ほぼ0なら何もしない
+  pushHistory(captureFullState());
+  const ox = parseFloat(document.getElementById('originX').value) || 0;
+  const oy = parseFloat(document.getElementById('originY').value) || 0;
+  const oz = parseFloat(document.getElementById('originZ').value) || 0;
+  committedBends.push({ axis: currentAxis, angleDeg, ox, oy, oz });
+  // 現在のベンドをリセット
+  document.getElementById('angleSlider').value = 0;
+  document.getElementById('angleVal').textContent = '0°';
+  document.getElementById('originX').value = 0;
+  document.getElementById('originY').value = 0;
+  document.getElementById('originZ').value = 0;
+  updateBend();
+  renderCommittedBendList();
+}
+
+function deleteCommittedBend(index) {
+  pushHistory(captureFullState());
+  committedBends.splice(index, 1);
+  updateBend();
+  renderCommittedBendList();
+}
+
+function renderCommittedBendList() {
+  const list = document.getElementById('committedBendList');
+  if (!list) return;
+  const countEl = document.getElementById('committedCount');
+  if (countEl) countEl.textContent = committedBends.length > 0 ? `${committedBends.length}件` : '0件';
+  if (committedBends.length === 0) {
+    list.innerHTML = '<div style="color:#8b949e;font-size:11px;padding:4px 0;">まだ確定済みベンドはありません</div>';
+    return;
+  }
+  list.innerHTML = '';
+  committedBends.forEach((b, i) => {
+    const item = document.createElement('div');
+    item.className = 'committed-bend-item';
+    const axisColors = { X: '#ff6b6b', Y: '#6bff8c', Z: '#6baeff' };
+    item.innerHTML = `
+      <div class="cb-info">
+        <span class="cb-badge" style="background:${axisColors[b.axis]}22;color:${axisColors[b.axis]};border:1px solid ${axisColors[b.axis]}55">${b.axis}軸</span>
+        <span class="cb-angle">${b.angleDeg > 0 ? '+' : ''}${b.angleDeg}°</span>
+        <span class="cb-origin" style="color:#8b949e;font-size:10px;">起点(${b.ox},${b.oy},${b.oz})</span>
+      </div>
+      <button class="cb-del" onclick="deleteCommittedBend(${i})" title="削除">✕</button>
+    `;
+    list.appendChild(item);
+  });
 }
 
 function updateOriginMarker() {
